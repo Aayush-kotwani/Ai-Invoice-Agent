@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: invoice-action-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: A2A_BEARER_TOKEN
+        generateValue: true
+      - key: A2A_BASE_URL
+        value: https://REPLACE-WITH-YOUR-RENDER-SERVICE.onrender.com/a2a
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: https://aipipe.org/openrouter/v1
+      - key: OPENAI_MODEL
+        value: google/gemini-2.5-flash-lite
+      - key: DATABASE_PATH
+        value: /var/data/invoice_agent.sqlite3
