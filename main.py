@@ -445,9 +445,9 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "4"))
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low").strip()
 
 
-def _chat(client: OpenAI, messages: list, timeout: float):
+def _chat(client: OpenAI, messages: list, timeout: float, temperature: float):
     """One model call; drops optional params the provider rejects."""
-    kwargs = dict(model=MODEL, temperature=0, max_tokens=8000, messages=messages, timeout=timeout)
+    kwargs = dict(model=MODEL, temperature=temperature, max_tokens=8000, messages=messages, timeout=timeout)
     extras = {"response_format": {"type": "json_object"}}
     if REASONING_EFFORT:
         extras["reasoning_effort"] = REASONING_EFFORT
@@ -465,44 +465,69 @@ def _chat(client: OpenAI, messages: list, timeout: float):
                 raise
 
 
-def _decide_chunk(packages: List[dict], deadline: float) -> List[dict]:
+def _attempt(packages: List[dict], timeout: float, temperature: float) -> List[dict]:
     client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, max_retries=0)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": canonical({"packages": packages})},
     ]
-    last_error = "unknown"
-    for attempt in range(2):
-        remaining = deadline - time.monotonic()
-        if remaining < 8:
-            break
-        # first attempt gets ~60% of the remaining time so a retry is still possible
-        timeout = remaining - 1 if attempt else max(8.0, remaining * 0.6)
-        try:
-            completion = _chat(client, messages, timeout)
-            parsed = _extract_json(completion.choices[0].message.content or "")
-            raw = parsed.get("decisions")
-            if not isinstance(raw, list):
-                raise ValueError("decisions missing")
-            by_id = {d.get("packageId"): d for d in raw if isinstance(d, dict)}
-            out = []
-            for p in packages:
-                d = by_id.get(p["packageId"])
-                if d is None:
-                    raise ValueError("missing decision for package %s" % p["packageId"])
-                nd = normalize_decision(d, p)
-                nd["packageId"] = p["packageId"]
-                out.append(nd)
-            for p, nd in zip(packages, out):
-                cache_decision(p, nd)  # cache as soon as a chunk succeeds
-            return out
-        except Exception as exc:
-            last_error = str(exc)[:300]
-            log.warning("model attempt %d failed: %s", attempt + 1, last_error)
-            if "timed out" not in last_error.lower():
-                messages = messages[:2] + [{"role": "user", "content":
-                    "Your previous answer was invalid (%s). Return the corrected full JSON object, "
-                    "copying evidenceRefs verbatim from the packages." % last_error}]
+    completion = _chat(client, messages, timeout, temperature)
+    parsed = _extract_json(completion.choices[0].message.content or "")
+    raw = parsed.get("decisions")
+    if not isinstance(raw, list):
+        raise ValueError("decisions missing")
+    by_id = {d.get("packageId"): d for d in raw if isinstance(d, dict)}
+    out = []
+    for p in packages:
+        d = by_id.get(p["packageId"])
+        if d is None:
+            raise ValueError("missing decision for package %s" % p["packageId"])
+        nd = normalize_decision(d, p)
+        nd["packageId"] = p["packageId"]
+        out.append(nd)
+    return out
+
+
+HEDGE_DELAYS = [0.0, 9.0, 18.0]  # start a backup call if the previous one is still silent
+
+
+def _decide_chunk(packages: List[dict], deadline: float) -> List[dict]:
+    """Hedged calls: first valid answer wins, so one hung request cannot sink the batch."""
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=len(HEDGE_DELAYS))
+    futures: list = []
+    seen_errors = set()
+    start = time.monotonic()
+    launched = 0
+    try:
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            pending = [f for f in futures if not f.done()]
+            for f in futures:
+                if f.done() and id(f) not in seen_errors:
+                    try:
+                        result = f.result()
+                    except Exception as exc:
+                        seen_errors.add(id(f))
+                        log.warning("model attempt failed: %s", str(exc)[:300])
+                    else:
+                        for p, nd in zip(packages, result):
+                            cache_decision(p, nd)
+                        return result
+            due = launched < len(HEDGE_DELAYS) and (now - start >= HEDGE_DELAYS[launched] or not pending)
+            if due and remaining >= 6:
+                temp = 0.0 if launched == 0 else 0.3
+                futures.append(pool.submit(_attempt, packages, max(5.0, remaining - 0.5), temp))
+                launched += 1
+                continue
+            if remaining <= 0 or (not pending and launched >= len(HEDGE_DELAYS)):
+                break
+            if not pending and remaining < 6:
+                break
+            time.sleep(0.2)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     raise ApiError(503, "DECISION_UNAVAILABLE")
 
 
