@@ -34,7 +34,7 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openrouter/v1
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 MAX_BODY_BYTES = 512 * 1024
-REQUEST_BUDGET_SECONDS = 38.0  # grader allows 45s per request
+REQUEST_BUDGET_SECONDS = 40.0  # grader allows 45s per request
 
 PROPOSAL_MEDIA = "application/vnd.ga5.invoice-action-proposals+json"
 RECEIPT_MEDIA = "application/vnd.ga5.invoice-action-receipts+json"
@@ -441,9 +441,31 @@ def _extract_json(text: str) -> dict:
         raise
 
 
-def decide_uncached(packages: List[dict], deadline: float) -> List[dict]:
-    if not OPENAI_API_KEY:
-        raise ApiError(503, "MODEL_NOT_CONFIGURED")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "4"))
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low").strip()
+
+
+def _chat(client: OpenAI, messages: list, timeout: float):
+    """One model call; drops optional params the provider rejects."""
+    kwargs = dict(model=MODEL, temperature=0, max_tokens=8000, messages=messages, timeout=timeout)
+    extras = {"response_format": {"type": "json_object"}}
+    if REASONING_EFFORT:
+        extras["reasoning_effort"] = REASONING_EFFORT
+    while True:
+        try:
+            return client.chat.completions.create(**kwargs, **extras)
+        except Exception as exc:
+            text = str(exc).lower()
+            dropped = False
+            for name in list(extras):
+                if name in text and ("400" in text or "invalid" in text or "unsupported" in text):
+                    extras.pop(name)
+                    dropped = True
+            if not dropped:
+                raise
+
+
+def _decide_chunk(packages: List[dict], deadline: float) -> List[dict]:
     client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, max_retries=0)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -452,23 +474,16 @@ def decide_uncached(packages: List[dict], deadline: float) -> List[dict]:
     last_error = "unknown"
     for attempt in range(2):
         remaining = deadline - time.monotonic()
-        if remaining < (6 if attempt else 3):
+        if remaining < 8:
             break
+        # first attempt gets ~60% of the remaining time so a retry is still possible
+        timeout = remaining - 1 if attempt else max(8.0, remaining * 0.6)
         try:
-            kwargs = dict(model=MODEL, temperature=0, max_tokens=7000, messages=messages,
-                          timeout=min(30.0, remaining - 1))
-            try:
-                completion = client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
-            except Exception as exc:
-                if "response_format" in str(exc).lower():
-                    completion = client.chat.completions.create(**kwargs)
-                else:
-                    raise
-            content = completion.choices[0].message.content or ""
-            parsed = _extract_json(content)
+            completion = _chat(client, messages, timeout)
+            parsed = _extract_json(completion.choices[0].message.content or "")
             raw = parsed.get("decisions")
-            if not isinstance(raw, list) or len(raw) != len(packages):
-                raise ValueError("wrong decision count")
+            if not isinstance(raw, list):
+                raise ValueError("decisions missing")
             by_id = {d.get("packageId"): d for d in raw if isinstance(d, dict)}
             out = []
             for p in packages:
@@ -478,17 +493,30 @@ def decide_uncached(packages: List[dict], deadline: float) -> List[dict]:
                 nd = normalize_decision(d, p)
                 nd["packageId"] = p["packageId"]
                 out.append(nd)
+            for p, nd in zip(packages, out):
+                cache_decision(p, nd)  # cache as soon as a chunk succeeds
             return out
-        except ApiError:
-            raise
         except Exception as exc:
             last_error = str(exc)[:300]
             log.warning("model attempt %d failed: %s", attempt + 1, last_error)
-            messages = messages[:2] + [
-                {"role": "user", "content": "Your previous answer was invalid (%s). Return the corrected full JSON "
-                                            "object, copying evidenceRefs verbatim from the packages." % last_error}
-            ]
+            if "timed out" not in last_error.lower():
+                messages = messages[:2] + [{"role": "user", "content":
+                    "Your previous answer was invalid (%s). Return the corrected full JSON object, "
+                    "copying evidenceRefs verbatim from the packages." % last_error}]
     raise ApiError(503, "DECISION_UNAVAILABLE")
+
+
+def decide_uncached(packages: List[dict], deadline: float) -> List[dict]:
+    if not OPENAI_API_KEY:
+        raise ApiError(503, "MODEL_NOT_CONFIGURED")
+    chunks = [packages[i:i + CHUNK_SIZE] for i in range(0, len(packages), CHUNK_SIZE)]
+    if len(chunks) == 1:
+        return _decide_chunk(chunks[0], deadline)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(6, len(chunks))) as pool:
+        futures = [pool.submit(_decide_chunk, c, deadline) for c in chunks]
+        results = [f.result() for f in futures]  # raises ApiError if any chunk failed
+    return [d for chunk in results for d in chunk]
 
 
 def get_decisions(packages: List[dict], deadline: float) -> List[dict]:
